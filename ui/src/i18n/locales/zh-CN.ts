@@ -44,6 +44,7 @@ export const zh_CN: TranslationMap = {
     aiAgents: "AI 与代理",
     debug: "调试",
     logs: "日志",
+    chatHistory: "对话历史",
   },
   subtitles: {
     agents: "工作区、工具、身份。",
@@ -64,6 +65,7 @@ export const zh_CN: TranslationMap = {
     aiAgents: "代理、模型、技能、工具、记忆和会话设置。",
     debug: "快照、事件、RPC。",
     logs: "实时网关日志。",
+    chatHistory: "本地保存的所有完整对话历史流。",
   },
   overview: {
     access: {

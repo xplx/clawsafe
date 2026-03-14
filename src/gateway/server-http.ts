@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
 import {
   createServer as createHttpServer,
   type Server as HttpServer,
@@ -786,6 +787,62 @@ export function createGatewayHttpServer(opts: {
         ? resolvePluginRoutePathContext(requestPath)
         : null;
       const requestStages: GatewayHttpRequestStage[] = [
+        {
+          name: "chat-history-api",
+          run: async () => {
+            if (requestPath === "/api/save-chat") {
+              if (req.method !== "POST") {
+                res.statusCode = 405;
+                res.end();
+                return true;
+              }
+              let body = "";
+              req.on("data", (chunk) => { body += chunk; });
+              await new Promise<void>((resolve) => req.on("end", resolve));
+              try {
+                const dirPath = "d:\\openCode\\clawsafe\\ui\\chat-logs";
+                await fs.mkdir(dirPath, { recursive: true });
+                const record = JSON.parse(body);
+                await fs.appendFile(dirPath + "\\dialogue.jsonl", JSON.stringify(record) + "\n", "utf8");
+                res.statusCode = 200;
+                res.setHeader("Content-Type", "application/json; charset=utf-8");
+                res.end(JSON.stringify({ success: true }));
+              } catch (e) {
+                res.statusCode = 500;
+                res.end(JSON.stringify({ error: String(e) }));
+              }
+              return true;
+            }
+            if (requestPath === "/api/get-chat-logs") {
+              if (req.method !== "GET") {
+                res.statusCode = 405;
+                res.end();
+                return true;
+              }
+              try {
+                const filePath = "d:\\openCode\\clawsafe\\ui\\chat-logs\\dialogue.jsonl";
+                let content = "";
+                try {
+                  content = await fs.readFile(filePath, "utf8");
+                } catch (e: any) {
+                  if (e.code !== "ENOENT") throw e;
+                }
+                const logs = content
+                  .split("\n")
+                  .filter((line) => line.trim())
+                  .map((line) => JSON.parse(line));
+                res.statusCode = 200;
+                res.setHeader("Content-Type", "application/json; charset=utf-8");
+                res.end(JSON.stringify({ logs }));
+              } catch (e) {
+                res.statusCode = 500;
+                res.end(JSON.stringify({ error: String(e) }));
+              }
+              return true;
+            }
+            return false;
+          }
+        },
         {
           name: "hooks",
           run: () => handleHooksRequest(req, res),

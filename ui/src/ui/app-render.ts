@@ -127,6 +127,7 @@ const lazyLogs = createLazy(() => import("./views/logs.ts"));
 const lazyNodes = createLazy(() => import("./views/nodes.ts"));
 const lazySessions = createLazy(() => import("./views/sessions.ts"));
 const lazySkills = createLazy(() => import("./views/skills.ts"));
+const lazyChatHistory = createLazy(() => import("./views/chat-history.ts"));
 
 function lazyRender<M>(getter: () => M | null, render: (mod: M) => unknown) {
   const mod = getter();
@@ -1441,6 +1442,14 @@ export function renderApp(state: AppViewState) {
                 assistantAvatar: state.assistantAvatar,
                 basePath: state.basePath ?? "",
               })
+            : nothing
+        }
+
+        ${
+          state.tab === "chatHistory"
+            ? lazyRender(lazyChatHistory, (m) => 
+                m.renderChatHistory({ onRequestUpdate: requestHostUpdate })
+              )
             : nothing
         }
 

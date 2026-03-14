@@ -52,6 +52,60 @@ export type ChatEventPayload = {
   errorMessage?: string;
 };
 
+function submitTurnLogs(payload: ChatEventPayload, state: ChatState, duration: number) {
+  try {
+    // 找最后一条 user 消息作为本轮输入内容
+    let userInputText = "";
+    const allMessages = state.chatMessages as Array<Record<string, unknown>>;
+    for (let i = allMessages.length - 1; i >= 0; i--) {
+      const msg = allMessages[i];
+      if (msg?.role === "user") {
+        const content = msg.content;
+        if (typeof content === "string") {
+          userInputText = content;
+        } else if (Array.isArray(content)) {
+          userInputText = content
+            .map((c: unknown) => {
+              const block = c as Record<string, unknown>;
+              return typeof block?.text === "string" ? block.text : "";
+            })
+            .filter(Boolean)
+            .join(" ");
+        }
+        break;
+      }
+    }
+
+    // 提取模型信息
+    const msg = payload.message as Record<string, unknown> | undefined;
+
+    const data = {
+      timestamp: Date.now(),
+      durationMs: duration,
+      runId: payload.runId,
+      sessionKey: state.sessionKey,
+      endState: payload.state,
+      errorMessage: payload.errorMessage,
+      userInput: userInputText,
+      model: msg?.model ?? null,
+      provider: msg?.provider ?? null,
+      message: payload.message,
+      history: state.chatMessages,
+    };
+
+    fetch("/api/save-chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }).catch((err) => {
+      console.warn("Failed to save chat log to dev server API:", err);
+    });
+  } catch (err) {
+    console.warn("Failed to assemble chat log payload:", err);
+  }
+}
+
+
 function maybeResetToolStream(state: ChatState) {
   const toolHost = state as ChatState & Partial<Parameters<typeof resetToolStream>[0]>;
   if (
@@ -304,6 +358,9 @@ export function handleChatEvent(state: ChatState, payload?: ChatEventPayload) {
         },
       ];
     }
+    const duration = state.chatStreamStartedAt ? Date.now() - state.chatStreamStartedAt : 0;
+    submitTurnLogs(payload, state, duration);
+
     state.chatStream = null;
     state.chatRunId = null;
     state.chatStreamStartedAt = null;
@@ -324,10 +381,16 @@ export function handleChatEvent(state: ChatState, payload?: ChatEventPayload) {
         ];
       }
     }
+    const duration = state.chatStreamStartedAt ? Date.now() - state.chatStreamStartedAt : 0;
+    submitTurnLogs(payload, state, duration);
+
     state.chatStream = null;
     state.chatRunId = null;
     state.chatStreamStartedAt = null;
   } else if (payload.state === "error") {
+    const duration = state.chatStreamStartedAt ? Date.now() - state.chatStreamStartedAt : 0;
+    submitTurnLogs(payload, state, duration);
+    
     state.chatStream = null;
     state.chatRunId = null;
     state.chatStreamStartedAt = null;
