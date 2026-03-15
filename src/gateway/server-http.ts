@@ -820,17 +820,72 @@ export function createGatewayHttpServer(opts: {
                 return true;
               }
               try {
-                const filePath = "d:\\openCode\\clawsafe\\ui\\chat-logs\\dialogue.jsonl";
-                let content = "";
+                const requirePath = require("node:path");
+                const requireOs = require("node:os");
+                const sessionsDir = requirePath.join(requireOs.homedir(), ".openclaw", "agents", "main", "sessions");
+                const logs: any[] = [];
                 try {
-                  content = await fs.readFile(filePath, "utf8");
+                  const files = await fs.readdir(sessionsDir);
+                  const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
+                  const allMessagesById = new Map();
+                  const allUserMessages: any[] = [];
+                  
+                  for (const file of jsonlFiles) {
+                    const content = await fs.readFile(requirePath.join(sessionsDir, file), "utf-8");
+                    const lines = content.split("\n").filter((l) => l.trim().length > 0);
+                    for (const line of lines) {
+                      try {
+                        const parsed = JSON.parse(line);
+                        if (parsed.id) allMessagesById.set(parsed.id, parsed);
+                        if (parsed.type === "message" && parsed.message?.role === "user") {
+                          allUserMessages.push(parsed);
+                        }
+                      } catch (e) {}
+                    }
+                  }
+                  
+                  allUserMessages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+                  
+                  for (const uMsg of allUserMessages) {
+                    let currentId = uMsg.id;
+                    const history = [uMsg.message];
+                    let childMsg;
+                    let lastMsg = uMsg;
+                    let finalAssistantMsg = null;
+                    
+                    do {
+                      childMsg = Array.from(allMessagesById.values()).find((m) => m.parentId === currentId);
+                      if (childMsg) {
+                        if (childMsg.type === "message") {
+                          if (childMsg.message?.role === "user") break;
+                          history.push(childMsg.message);
+                          if (childMsg.message?.role === "assistant") {
+                            finalAssistantMsg = childMsg;
+                          }
+                        }
+                        currentId = childMsg.id;
+                        lastMsg = childMsg;
+                      }
+                    } while (childMsg);
+                    
+                    const durationMs = new Date(lastMsg.timestamp).getTime() - new Date(uMsg.timestamp).getTime();
+                    logs.push({
+                      timestamp: new Date(uMsg.timestamp).getTime(),
+                      durationMs: durationMs,
+                      runId: uMsg.id,
+                      sessionKey: "agent:main:main",
+                      endState: "final",
+                      userInput: uMsg.message?.content?.[0]?.text || "",
+                      message: finalAssistantMsg ? finalAssistantMsg.message : null,
+                      skillsUsed: [],
+                      tokenUsage: null,
+                      history: history
+                    });
+                  }
                 } catch (e: any) {
                   if (e.code !== "ENOENT") throw e;
                 }
-                const logs = content
-                  .split("\n")
-                  .filter((line) => line.trim())
-                  .map((line) => JSON.parse(line));
+                
                 res.statusCode = 200;
                 res.setHeader("Content-Type", "application/json; charset=utf-8");
                 res.end(JSON.stringify({ logs }));

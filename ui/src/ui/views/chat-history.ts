@@ -47,25 +47,46 @@ function extractLogDetails(log: any) {
   }
 
   // 2. 获取 modelReply
+  // 优先从 log.message 提取，回退到 history 最后一条 assistant 消息
   let modelReply = "—";
+  const extractContentText = (content: unknown): string => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return (content as any[])
+      .filter((c: any) => c?.type === "text" && c.text)
+      .map((c: any) => c.text as string)
+      .join("\n");
+  };
   if (log.message) {
     if (typeof log.message.text === "string" && log.message.text) {
       modelReply = log.message.text;
     } else if (Array.isArray(log.message.content)) {
-      const parts = log.message.content
-        .filter((c: any) => c?.type === "text" && c.text)
-        .map((c: any) => c.text as string);
-      if (parts.length > 0) modelReply = parts.join("\n");
+      const t = extractContentText(log.message.content);
+      if (t) modelReply = t;
+    }
+  }
+  // 若 log.message 不存在或无文本，从 history 找最后一条 assistant text
+  if (modelReply === "—" && Array.isArray(log.history)) {
+    for (let i = log.history.length - 1; i >= 0; i--) {
+      const msg = log.history[i] as any;
+      if (!msg || msg.role !== "assistant") continue;
+      // 跳过纯工具调用消息（content 全是 toolCall）
+      const txt = extractContentText(msg.content);
+      if (txt && txt.trim()) {
+        modelReply = txt.trim();
+        break;
+      }
     }
   }
 
   // 3. 获取 skillsUsed
+  // 优先读 log.skillsUsed（新格式直接存储），否则从 history 提取
   let skillsUsed: string[] = [];
-  if (Array.isArray(log.history)) {
+  if (Array.isArray(log.skillsUsed) && log.skillsUsed.length > 0) {
+    skillsUsed = log.skillsUsed as string[];
+  } else if (Array.isArray(log.history)) {
     for (const msg of log.history) {
       if (!msg) continue;
-      
-      // 遍历 content 数组找 tool usage
       if (Array.isArray(msg.content)) {
         for (const c of msg.content) {
           if ((c?.type === "toolCall" || c?.type === "tool_use") && c.name) {
@@ -73,32 +94,73 @@ function extractLogDetails(log: any) {
           }
         }
       }
-      
-      // 兼容某些顶层可能自带 toolCall 和 name
       if (msg.type === "toolCall" && msg.name) {
         skillsUsed.push(msg.name);
       }
-      
-      // 兼容记录直接有 toolCalls 数组的格式
       if (Array.isArray(msg.toolCalls)) {
-         for (const tc of msg.toolCalls) {
-            if (tc?.function?.name) {
-               skillsUsed.push(tc.function.name);
-            }
-         }
+        for (const tc of msg.toolCalls) {
+          if (tc?.function?.name) {
+            skillsUsed.push(tc.function.name);
+          }
+        }
       }
     }
   }
 
-  // 4. 获取 tokens
+  // 4. 获取 tokens, model, provider
   let inputTokens: number | string = "—";
   let outputTokens: number | string = "—";
-  const usage = log.message?.usage;
-  if (usage) {
-    const inp = usage.input ?? usage.inputTokens ?? usage.input_tokens;
-    const out = usage.output ?? usage.outputTokens ?? usage.output_tokens;
-    if (inp !== undefined) inputTokens = inp;
-    if (out !== undefined) outputTokens = out;
+  let model: string | null = (log.model as string | null) ?? null;
+  let provider: string | null = (log.provider as string | null) ?? null;
+
+  // 优先读新格式 log.tokenUsage 直接字段（由 submitTurnLogs 填充）
+  if (log.tokenUsage) {
+    const tu = log.tokenUsage as any;
+    const inp = tu.inputTokens ?? tu.input ?? tu.input_tokens;
+    const out = tu.outputTokens ?? tu.output ?? tu.output_tokens;
+    if (typeof inp === "number") inputTokens = inp;
+    if (typeof out === "number") outputTokens = out;
+  }
+
+  // 若新格式无数据，回退到 log.message?.usage
+  if (inputTokens === "—" || outputTokens === "—") {
+    let usage = log.message?.usage;
+
+    if (Array.isArray(log.history)) {
+      let sumInp = 0;
+      let sumOut = 0;
+      let foundUsage = false;
+
+      for (let i = log.history.length - 1; i >= 0; i--) {
+        const msg = log.history[i];
+        if (!msg) continue;
+        if (msg.role === "user") break;
+
+        if (msg.usage) {
+          const inp2 = msg.usage.input ?? msg.usage.inputTokens ?? msg.usage.input_tokens ?? 0;
+          const out2 = msg.usage.output ?? msg.usage.outputTokens ?? msg.usage.output_tokens ?? 0;
+          if (inp2 > 0 || out2 > 0) {
+            foundUsage = true;
+            sumInp += inp2;
+            sumOut += out2;
+          }
+        }
+
+        if (!model && typeof msg.model === "string") model = msg.model;
+        if (!provider && typeof msg.provider === "string") provider = msg.provider;
+      }
+
+      if (!usage && foundUsage) {
+        usage = { input: sumInp, output: sumOut };
+      }
+    }
+
+    if (usage) {
+      const inp = usage.input ?? usage.inputTokens ?? usage.input_tokens;
+      const out = usage.output ?? usage.outputTokens ?? usage.output_tokens;
+      if (inputTokens === "—" && inp !== undefined && inp !== null) inputTokens = inp;
+      if (outputTokens === "—" && out !== undefined && out !== null) outputTokens = out;
+    }
   }
 
   return {
@@ -107,8 +169,8 @@ function extractLogDetails(log: any) {
     skillsUsed: Array.from(new Set(skillsUsed)),
     inputTokens,
     outputTokens,
-    model: (log.model as string | null) ?? null,
-    provider: (log.provider as string | null) ?? null,
+    model,
+    provider,
   };
 }
 
@@ -116,8 +178,32 @@ function truncate(str: string, max: number): string {
   return str.length > max ? str.slice(0, max) + "…" : str;
 }
 
+/**
+ * 当 log.durationMs 为 0 时，尝试从 history 中找到最后一个 user 消息和最后一个 assistant 消息
+ * 的 timestamp 差值来推算实际耗时。
+ */
+function resolveDuration(log: any): number | undefined {
+  const d = log.durationMs as number | undefined;
+  if (d !== undefined && d !== null && d > 0) return d;
+  // 降级：用 history 时间戳推算
+  if (Array.isArray(log.history)) {
+    let lastUserTs = 0;
+    let lastAssistantTs = 0;
+    for (const msg of log.history) {
+      if (!msg || typeof msg.timestamp !== "number") continue;
+      if (msg.role === "user") lastUserTs = msg.timestamp;
+      if (msg.role === "assistant") lastAssistantTs = msg.timestamp;
+    }
+    if (lastUserTs > 0 && lastAssistantTs > lastUserTs) {
+      return lastAssistantTs - lastUserTs;
+    }
+  }
+  return d;
+}
+
 function fmtDuration(ms: number | undefined): string {
   if (ms === undefined || ms === null) return "—";
+  if (ms === 0) return "0ms";
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(2)}s`;
 }
@@ -202,7 +288,7 @@ function renderDetailModal(log: any, update: () => void) {
         ">
           <span style="display:flex;align-items:center;gap:5px;">
             <span style="color:var(--fg-muted);">耗时</span>
-            <strong>${fmtDuration(log.durationMs)}</strong>
+            <strong>${fmtDuration(resolveDuration(log))}</strong>
           </span>
           <span style="display:flex;align-items:center;gap:5px;">
             <span style="color:var(--fg-muted);">输入 Token</span>
@@ -351,7 +437,7 @@ export function renderChatHistory(props: { onRequestUpdate?: () => void }) {
                             ? d.skillsUsed.map(s => html`<span style="display:inline-block;background:var(--bg-inset);border:1px solid var(--border-color);border-radius:3px;padding:1px 5px;margin:1px;font-size:11px;">${s}</span>`)
                             : html`<span style="color:var(--fg-muted);">—</span>`}
                         </td>
-                        <td style="padding:10px 12px; text-align:right; white-space:nowrap;">${fmtDuration(log.durationMs)}</td>
+                        <td style="padding:10px 12px; text-align:right; white-space:nowrap;">${fmtDuration(resolveDuration(log))}</td>
                         <td style="padding:10px 12px; text-align:right;">${d.inputTokens}</td>
                         <td style="padding:10px 12px; text-align:right;">${d.outputTokens}</td>
                         <td style="padding:10px 12px; text-align:center;">

@@ -73,18 +73,72 @@ export default defineConfig(() => {
           });
           server.middlewares.use("/api/get-chat-logs", (req, res) => {
             if (req.method === "GET") {
-              const logFile = path.resolve(here, "chat-logs", "dialogue.jsonl");
               try {
-                if (fs.existsSync(logFile)) {
-                  const content = fs.readFileSync(logFile, "utf-8");
-                  const lines = content.split("\\n").filter((line) => line.trim().length > 0);
-                  const logs = lines.map((line) => JSON.parse(line));
-                  res.setHeader("Content-Type", "application/json");
-                  res.end(JSON.stringify({ logs }));
-                } else {
-                  res.setHeader("Content-Type", "application/json");
-                  res.end(JSON.stringify({ logs: [] }));
+                const os = require("node:os");
+                const sessionsDir = path.join(os.homedir(), ".openclaw", "agents", "main", "sessions");
+                const logs = [];
+                
+                if (fs.existsSync(sessionsDir)) {
+                  const files = fs.readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"));
+                  const allMessagesById = new Map();
+                  const allUserMessages = [];
+                  
+                  for (const file of files) {
+                    const content = fs.readFileSync(path.join(sessionsDir, file), "utf-8");
+                    const lines = content.split("\n").filter((l) => l.trim().length > 0);
+                    for (const line of lines) {
+                      try {
+                        const parsed = JSON.parse(line);
+                        if (parsed.id) allMessagesById.set(parsed.id, parsed);
+                        if (parsed.type === "message" && parsed.message?.role === "user") {
+                          allUserMessages.push(parsed);
+                        }
+                      } catch (e) {}
+                    }
+                  }
+                  
+                  allUserMessages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+                  
+                  for (const uMsg of allUserMessages) {
+                    let currentId = uMsg.id;
+                    const history = [uMsg.message];
+                    let childMsg;
+                    let lastMsg = uMsg;
+                    let finalAssistantMsg = null;
+                    
+                    do {
+                      childMsg = Array.from(allMessagesById.values()).find((m) => m.parentId === currentId);
+                      if (childMsg) {
+                        if (childMsg.type === "message") {
+                          if (childMsg.message?.role === "user") break;
+                          history.push(childMsg.message);
+                          if (childMsg.message?.role === "assistant") {
+                            finalAssistantMsg = childMsg;
+                          }
+                        }
+                        currentId = childMsg.id;
+                        lastMsg = childMsg;
+                      }
+                    } while (childMsg);
+                    
+                    const durationMs = new Date(lastMsg.timestamp).getTime() - new Date(uMsg.timestamp).getTime();
+                    logs.push({
+                      timestamp: new Date(uMsg.timestamp).getTime(),
+                      durationMs: durationMs,
+                      runId: uMsg.id,
+                      sessionKey: "agent:main:main",
+                      endState: "final",
+                      userInput: uMsg.message?.content?.[0]?.text || "",
+                      message: finalAssistantMsg ? finalAssistantMsg.message : null,
+                      skillsUsed: [],
+                      tokenUsage: null,
+                      history: history
+                    });
+                  }
                 }
+                
+                res.setHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ logs }));
               } catch (e) {
                 res.statusCode = 500;
                 res.end(JSON.stringify({ error: String(e) }));

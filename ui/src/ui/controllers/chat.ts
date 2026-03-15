@@ -52,43 +52,169 @@ export type ChatEventPayload = {
   errorMessage?: string;
 };
 
+/**
+ * 近似 token 计数：中文约 1.5 字符/token，英文约 4 字符/token。
+ * 误差通常在 10-15% 以内，适合日志统计用途。
+ */
+function approximateTokenCount(text: string): number {
+  if (!text) return 0;
+  let chineseCount = 0;
+  let otherCount = 0;
+  for (const ch of text) {
+    // 基本汉字 + CJK 扩展
+    if (ch >= "\u4e00" && ch <= "\u9fff") {
+      chineseCount++;
+    } else {
+      otherCount++;
+    }
+  }
+  // 中文字符按 ~0.67 token/字计，英文等按 ~0.25 token/字计
+  return Math.ceil(chineseCount * 0.67 + otherCount * 0.25);
+}
+
+/**
+ * 从消息内容块（content array 或 text 字段）中提取纯文本。
+ */
+function extractTextFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block: unknown) => {
+      const b = block as Record<string, unknown>;
+      if (b?.type === "text" && typeof b.text === "string") return b.text;
+      if (b?.type === "thinking" && typeof b.thinking === "string") return b.thinking;
+      if (b?.type === "toolResult" && Array.isArray(b.content)) {
+        return extractTextFromContent(b.content);
+      }
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * 从 history 中汇总所有 assistant 消息里已有的 usage（若 gateway 有填充则直接用）。
+ * 若全部都是 0，则退回到客户端近似计算。
+ */
+function computeTokenUsage(
+  historyMessages: Array<Record<string, unknown>>,
+  finalMessage: Record<string, unknown> | undefined,
+): { inputTokens: number; outputTokens: number; source: "gateway" | "approximate" } {
+  // 优先尝试从 history 中汇聚 gateway 已填充的 usage
+  let totalInput = 0;
+  let totalOutput = 0;
+  let hasGatewayData = false;
+
+  const allMsgs = finalMessage ? [...historyMessages, finalMessage] : historyMessages;
+
+  for (const m of allMsgs) {
+    const usage = m.usage as Record<string, number> | undefined;
+    if (usage && (usage.input > 0 || usage.output > 0)) {
+      hasGatewayData = true;
+      totalInput += usage.input ?? 0;
+      totalOutput += usage.output ?? 0;
+    }
+  }
+
+  if (hasGatewayData) {
+    return { inputTokens: totalInput, outputTokens: totalOutput, source: "gateway" };
+  }
+
+  // 退回到客户端近似计算
+  // 输入 token = 所有历史消息的文本（不含本次 assistant 回复）
+  let inputText = "";
+  for (const m of historyMessages) {
+    inputText += extractTextFromContent(m.content) + "\n";
+  }
+
+  // 输出 token = 本次 finalMessage 的文本
+  let outputText = "";
+  if (finalMessage) {
+    outputText = extractTextFromContent(finalMessage.content);
+  }
+
+  return {
+    inputTokens: approximateTokenCount(inputText),
+    outputTokens: approximateTokenCount(outputText),
+    source: "approximate",
+  };
+}
+
+/**
+ * 从 history 中提取所有被调用的 Skills/工具名称列表。
+ */
+function extractSkillsUsed(historyMessages: Array<Record<string, unknown>>): string[] {
+  const skills = new Set<string>();
+  for (const m of historyMessages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const block of m.content as Array<Record<string, unknown>>) {
+      // toolCall 块中的 name 字段就是 skill/tool 名
+      if (block?.type === "toolCall" && typeof block.name === "string") {
+        skills.add(block.name);
+      }
+    }
+  }
+  return [...skills];
+}
+
 function submitTurnLogs(payload: ChatEventPayload, state: ChatState, duration: number) {
   try {
-    // 找最后一条 user 消息作为本轮输入内容
+    // 找最后一条 user 消息作为本轮输入内容，同时记下其 timestamp 用于备用耗时计算
     let userInputText = "";
+    let lastUserTimestamp = 0;
     const allMessages = state.chatMessages as Array<Record<string, unknown>>;
     for (let i = allMessages.length - 1; i >= 0; i--) {
-      const msg = allMessages[i];
-      if (msg?.role === "user") {
-        const content = msg.content;
-        if (typeof content === "string") {
-          userInputText = content;
-        } else if (Array.isArray(content)) {
-          userInputText = content
-            .map((c: unknown) => {
-              const block = c as Record<string, unknown>;
-              return typeof block?.text === "string" ? block.text : "";
-            })
-            .filter(Boolean)
-            .join(" ");
+      const m = allMessages[i];
+      if (m?.role === "user") {
+        userInputText = extractTextFromContent(m.content);
+        if (typeof m.timestamp === "number") {
+          lastUserTimestamp = m.timestamp;
         }
         break;
       }
     }
 
-    // 提取模型信息
-    const msg = payload.message as Record<string, unknown> | undefined;
+    // 提取模型信息（来自 payload.message）
+    const finalMsg = payload.message as Record<string, unknown> | undefined;
+
+    // 若 chatStreamStartedAt 已丢失（duration === 0），则用消息 timestamp 推算实际耗时：
+    // endTs 优先取 finalMsg.timestamp（模型完成时间），否则用 Date.now()
+    let resolvedDuration = duration;
+    if (resolvedDuration === 0 && lastUserTimestamp > 0) {
+      const endTs =
+        typeof finalMsg?.timestamp === "number" ? finalMsg.timestamp : Date.now();
+      const computed = endTs - lastUserTimestamp;
+      if (computed > 0) {
+        resolvedDuration = computed;
+      }
+    }
+
+    // 计算 token 使用量
+    const { inputTokens, outputTokens, source: tokenSource } = computeTokenUsage(
+      allMessages,
+      finalMsg,
+    );
+
+    // 提取本次对话用到的 Skills
+    const skillsUsed = extractSkillsUsed(allMessages);
 
     const data = {
       timestamp: Date.now(),
-      durationMs: duration,
+      durationMs: resolvedDuration,
       runId: payload.runId,
       sessionKey: state.sessionKey,
       endState: payload.state,
       errorMessage: payload.errorMessage,
       userInput: userInputText,
-      model: msg?.model ?? null,
-      provider: msg?.provider ?? null,
+      model: finalMsg?.model ?? null,
+      provider: finalMsg?.provider ?? null,
+      tokenUsage: {
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+        source: tokenSource,
+      },
+      skillsUsed,
       message: payload.message,
       history: state.chatMessages,
     };
